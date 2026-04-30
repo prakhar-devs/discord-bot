@@ -18,6 +18,13 @@ export class MessageHandler {
       return;
     }
 
+    // Remote link command: "link https://..."
+    if (message.content.startsWith('link ')) {
+      const url = message.content.substring(5).trim();
+      await this.handleRemoteLink(message, url);
+      return;
+    }
+
     const matches = message.content.match(CONFIG.REDDIT_URL_REGEX);
     if (!matches) return;
 
@@ -81,6 +88,41 @@ export class MessageHandler {
     }
 
     await statusMsg.edit('✅ All local videos processed!');
+  }
+
+  private static async handleRemoteLink(message: Message, url: string) {
+    let statusMsg: Message | null = null;
+    if (message.channel.isTextBased()) {
+      try {
+        statusMsg = await (message.channel as any).send('⏳ Preparing to process remote video...');
+      } catch { }
+    }
+
+    const filePath = FileUtils.getTempPath('.mp4');
+    try {
+      if (statusMsg) await statusMsg.edit('📥 Downloading video...');
+      await DownloadService.downloadFile(url, filePath);
+
+      const sizeMB = FileUtils.getFileSizeMB(filePath);
+      Logger.info(`Downloaded remote video: ${sizeMB.toFixed(2)} MB`);
+
+      if (statusMsg) await statusMsg.edit(`📦 Processing video (${sizeMB.toFixed(2)} MB)...`);
+
+      // Always use uploadVideoInChunks for direct links to ensure the thread + preview behavior
+      await DiscordService.uploadVideoInChunks(filePath, message.channel);
+
+      if (statusMsg) await statusMsg.edit('✅ Video processed successfully!');
+    } catch (err: any) {
+      Logger.error(`Remote link processing failed: ${url}`, err);
+      const errorMsg = `❌ Failed to process link: ${err.message}`;
+      if (statusMsg) await statusMsg.edit(errorMsg);
+      else await message.reply(errorMsg);
+    } finally {
+      FileUtils.cleanupFile(filePath);
+      if (statusMsg) {
+        setTimeout(() => statusMsg?.delete().catch(() => { }), 5000);
+      }
+    }
   }
 
   private static async processPost(message: Message, post: any, statusMsg: Message | null) {
