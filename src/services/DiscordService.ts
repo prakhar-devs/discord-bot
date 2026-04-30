@@ -44,7 +44,7 @@ export class DiscordService {
     }
   }
 
-  static async uploadVideoInChunks(inputPath: string, channel: any, maxChunkSizeMB = 9): Promise<void> {
+  static async uploadVideoInChunks(inputPath: string, channel: any, maxChunkSizeMB = 9): Promise<any> {
     if (!fs.existsSync(inputPath)) throw new Error(`Input video not found: ${inputPath}`);
 
     const absoluteInputPath = path.resolve(inputPath);
@@ -68,12 +68,36 @@ export class DiscordService {
 
       Logger.info(`Analyzing keyframes...`);
       const keyframeTimes = await VideoService.getKeyframeTimes(absoluteInputPath);
-      const cutPoints = VideoService.calculateCutPoints(keyframeTimes, duration, totalSizeBytes, 9.5);
       
-      Logger.info(`Splitting into ${cutPoints.length} chunks...`);
-      const chunkFiles = await VideoService.splitVideo(absoluteInputPath, cutPoints, duration, tempDir);
+      Logger.info(`Splitting video adaptively...`);
+      const chunkFiles = await VideoService.splitVideo(absoluteInputPath, keyframeTimes, duration, totalSizeBytes, tempDir);
 
-      Logger.info(`Uploading sequentially to Discord...`);
+      // NEW: Extract frames, upload them, and create a thread for the parts
+      let uploadTarget = channel;
+      if (channel.isTextBased()) {
+        try {
+          const frames = await VideoService.extractRandomFrames(absoluteInputPath, duration, CONFIG.FRAME_EXTRACT_COUNT, tempDir);
+          const frameFiles = frames.map((f, idx) => ({ attachment: f, name: `preview_${idx}.jpg` }));
+          
+          const imageMsg = await channel.send({ 
+            content: `🎬 **Video Preview** (${chunkFiles.length} parts)`,
+            files: frameFiles 
+          });
+          
+          // Use any for thread creation to bypass potential type narrowing issues with partials
+          const thread = await (imageMsg as any).startThread({
+            name: 'Media',
+            autoArchiveDuration: 60,
+          });
+          
+          uploadTarget = thread;
+          Logger.success(`Thread 'Media' created for sequential upload.`);
+        } catch (threadErr: any) {
+          Logger.warn(`Failed to create thread: ${threadErr.message}. Falling back to channel.`);
+        }
+      }
+
+      Logger.info(`Uploading sequentially to ${uploadTarget.name || 'target'}...`);
       for (let i = 0; i < chunkFiles.length; i++) {
         const chunkPath = chunkFiles[i];
         const fileName = `part_${String(i + 1).padStart(3, '0')}.mp4`;
@@ -87,7 +111,7 @@ export class DiscordService {
         while (!success && retries >= 0) {
           try {
             const fileBuffer = await fsPromises.readFile(chunkPath);
-            const uploadPromise = channel.send({
+            const uploadPromise = (uploadTarget as any).send({
               content: `🎞️ Part ${i + 1}/${chunkFiles.length}`,
               files: [{ attachment: fileBuffer, name: fileName }]
             });
@@ -109,6 +133,7 @@ export class DiscordService {
 
         if (!success) throw new Error(`Failed to upload Part ${i + 1} after all retries.`);
       }
+      return uploadTarget;
     } finally {
       FileUtils.cleanupDir(tempDir);
     }

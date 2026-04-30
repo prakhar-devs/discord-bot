@@ -151,9 +151,9 @@ export class MessageHandler {
       const finalSize = FileUtils.getFileSizeMB(uploadPath);
       if (finalSize > CONFIG.MAX_FILE_SIZE_MB) {
         try {
-          await DiscordService.uploadVideoInChunks(uploadPath, message.channel);
-          if (message.channel.isTextBased()) {
-            await (message.channel as any).send({ content: `🎬 Full video link: ${fallbackUrl}` });
+          const target = await DiscordService.uploadVideoInChunks(uploadPath, message.channel);
+          if (target && target.isTextBased()) {
+            await (target as any).send({ content: `🎬 Full video link: ${fallbackUrl}` });
           }
           return;
         } catch (chunkErr: any) {
