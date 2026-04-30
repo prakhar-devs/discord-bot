@@ -52,19 +52,35 @@ export class MessageHandler {
   }
 
   private static async handleLocalUpload(message: Message) {
-    const inputPath = './input_videos/test.mp4';
-    if (!fs.existsSync(inputPath)) {
-      await message.reply('❌ No `test.mp4` found in `input_videos/` folder.');
+    const inputDir = './input_videos';
+    if (!fs.existsSync(inputDir)) {
+      await message.reply('❌ `input_videos/` folder does not exist.');
       return;
     }
 
-    const statusMsg = await message.reply('⏳ Preparing to split and upload local video...');
-    try {
-      await DiscordService.uploadVideoInChunks(inputPath, message.channel);
-      await statusMsg.edit('✅ Finished uploading local video!');
-    } catch (err: any) {
-      await statusMsg.edit(`❌ Upload failed: ${err.message}`);
+    const files = fs.readdirSync(inputDir).filter(file => 
+      ['.mp4', '.mov', '.mkv'].includes(file.toLowerCase().slice(file.lastIndexOf('.')))
+    );
+
+    if (files.length === 0) {
+      await message.reply('ℹ️ No videos found in `input_videos/` folder.');
+      return;
     }
+
+    const statusMsg = await message.reply(`🚀 Found ${files.length} videos. Starting sequential processing...`);
+    
+    for (const file of files) {
+      const filePath = `${inputDir}/${file}`;
+      try {
+        await (message.channel as any).send(`📦 Processing: **${file}**`);
+        await DiscordService.uploadVideoInChunks(filePath, message.channel);
+      } catch (err: any) {
+        Logger.error(`Failed to process ${file}`, err);
+        await (message.channel as any).send(`❌ Failed to process **${file}**: ${err.message}`);
+      }
+    }
+
+    await statusMsg.edit('✅ All local videos processed!');
   }
 
   private static async processPost(message: Message, post: any, statusMsg: Message | null) {

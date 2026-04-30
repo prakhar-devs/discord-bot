@@ -132,62 +132,92 @@ export class VideoService {
     if (!ffmpeg) throw new Error('FFmpeg not installed');
 
     const bytesPerSecond = totalSizeBytes / totalDuration;
-    const targetSizeBytes = 9.8 * 1024 * 1024; // Aim for 9.8MB to be safe
+    const targetSizeBytes = 9.8 * 1024 * 1024;
 
     let currentStart = 0;
     let keyframeIndex = 0;
     let chunkCount = 0;
 
     while (currentStart < totalDuration - 0.1) {
-      // 1. Find a candidate keyframe based on average bitrate estimation
+      // 1. Initial guess based on average bitrate
       let candidateIdx = keyframeIndex + 1;
       while (candidateIdx < keyframeTimes.length) {
         const estDuration = keyframeTimes[candidateIdx] - currentStart;
         if (estDuration * bytesPerSecond > targetSizeBytes) {
-          // Go back one if the estimation exceeded target
           candidateIdx = Math.max(candidateIdx - 1, keyframeIndex + 1);
           break;
         }
         candidateIdx++;
       }
 
-      // 2. Iteratively refine the cut point by checking actual file size
-      let success = false;
-      while (candidateIdx > keyframeIndex) {
+      // 2. Greedy search phase
+      let lastGoodPath: string | null = null;
+      let lastGoodSize = 0;
+      let lastGoodIdx = candidateIdx;
+
+      while (true) {
         const end = (candidateIdx >= keyframeTimes.length) ? totalDuration : keyframeTimes[candidateIdx];
-        const outputPath = path.join(tempDir, `chunk_${String(chunkCount).padStart(3, '0')}.mp4`);
+        const trialPath = path.join(tempDir, `trial.mp4`);
 
         await new Promise<void>((resolve, reject) => {
-          const args = ['-y', '-ss', String(currentStart), '-to', String(end), '-i', inputPath, '-c', 'copy', '-avoid_negative_ts', 'make_zero', outputPath];
+          const args = ['-y', '-ss', String(currentStart), '-to', String(end), '-i', inputPath, '-c', 'copy', '-avoid_negative_ts', 'make_zero', trialPath];
           const proc = spawn(ffmpeg, args, { stdio: 'ignore' });
           proc.on('close', (code) => code === 0 ? resolve() : reject(new Error(`Split failed: ${code}`)));
           proc.on('error', reject);
         });
 
-        const sizeMB = FileUtils.getFileSizeMB(outputPath);
-        if (sizeMB <= 9.9 || candidateIdx === keyframeIndex + 1) {
-          // Success! Either it fits, or it's the smallest possible GOP (which we must keep)
-          chunks.push(outputPath);
-          Logger.success(`chunk_${chunkCount}: ${sizeMB.toFixed(2)} MB (${currentStart.toFixed(2)}s → ${end.toFixed(2)}s)`);
-          
-          currentStart = end;
-          keyframeIndex = candidateIdx;
-          chunkCount++;
-          success = true;
-          break;
+        const sizeMB = FileUtils.getFileSizeMB(trialPath);
+
+        if (sizeMB <= 9.9) {
+          // This fits. Cache it as the best so far.
+          if (lastGoodPath) FileUtils.cleanupFile(lastGoodPath);
+          lastGoodPath = path.join(tempDir, `best_chunk_${chunkCount}.mp4`);
+          fs.renameSync(trialPath, lastGoodPath);
+          lastGoodSize = sizeMB;
+          lastGoodIdx = candidateIdx;
+
+          if (candidateIdx >= keyframeTimes.length || sizeMB >= 9.6) {
+            // Reached end or close enough to 10MB
+            break;
+          }
+          // Try adding more
+          Logger.info(`chunk_${chunkCount} is small (${sizeMB.toFixed(2)} MB), trying to add more keyframes...`);
+          candidateIdx++;
         } else {
-          // Too large! Backtrack one keyframe and try again
-          Logger.warn(`chunk_${chunkCount} too large (${sizeMB.toFixed(2)} MB), backtracking one keyframe...`);
-          candidateIdx--;
+          // Too large!
+          if (!lastGoodPath) {
+            // We started too high and haven't found a single good segment yet.
+            if (candidateIdx === keyframeIndex + 1) {
+              // Even a single GOP is too large. We have to take it.
+              lastGoodPath = path.join(tempDir, `best_chunk_${chunkCount}.mp4`);
+              fs.renameSync(trialPath, lastGoodPath);
+              lastGoodSize = sizeMB;
+              lastGoodIdx = candidateIdx;
+              break;
+            }
+            // Backtrack and keep looking
+            Logger.warn(`chunk_${chunkCount} too large (${sizeMB.toFixed(2)} MB), backtracking...`);
+            candidateIdx--;
+          } else {
+            // We already had a good segment, and this trial made it too large.
+            // So the previous segment is the maximum possible.
+            FileUtils.cleanupFile(trialPath);
+            break;
+          }
         }
       }
 
-      if (!success) {
-        // This only happens if a single GOP is somehow larger than 10MB
-        // For now, we'll break to avoid infinite loop, but in production we might re-encode
-        Logger.error('Could not find a valid split point for GOP.');
-        break;
-      }
+      // 3. Finalize chunk
+      const finalPath = path.join(tempDir, `chunk_${String(chunkCount).padStart(3, '0')}.mp4`);
+      fs.renameSync(lastGoodPath!, finalPath);
+      
+      chunks.push(finalPath);
+      const chunkEnd = (lastGoodIdx >= keyframeTimes.length) ? totalDuration : keyframeTimes[lastGoodIdx];
+      Logger.success(`chunk_${chunkCount}: ${lastGoodSize.toFixed(2)} MB (${currentStart.toFixed(2)}s → ${chunkEnd.toFixed(2)}s)`);
+      
+      currentStart = chunkEnd;
+      keyframeIndex = lastGoodIdx;
+      chunkCount++;
     }
 
     return chunks;
