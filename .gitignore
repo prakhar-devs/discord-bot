@@ -1,0 +1,6 @@
+node_modules/
+.env
+temp/
+input_videos/
+*.mp4
+dist/

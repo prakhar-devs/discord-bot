@@ -1,0 +1,510 @@
+import { Client, GatewayIntentBits } from 'discord.js';
+import axios from 'axios';
+import fs from 'fs';
+import path from 'path';
+import { exec, execSync } from 'child_process';
+
+// ─── Configuration ───────────────────────────────────────────────────────────
+
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const REDDIT_COOKIE = process.env.REDDIT_COOKIE || '';
+
+if (!BOT_TOKEN) {
+  console.error('❌ BOT_TOKEN not set. Add it to your .env file.');
+  process.exit(1);
+}
+
+if (!REDDIT_COOKIE) {
+  console.warn('⚠️  REDDIT_COOKIE not set — NSFW posts may fail. See .env.example for instructions.');
+}
+
+const REDDIT_URL_REGEX = /https?:\/\/(?:www\.)?reddit\.com\/\S+/gi;
+const MAX_UPLOAD_MB = 8;
+const MAX_COMPRESS_MB = 25;
+const COMPRESS_TIMEOUT_MS = 60000;
+const TEMP_DIR = './temp';
+
+const AXIOS_CONFIG = {
+  headers: {
+    'User-Agent': 'Mozilla/5.0 (compatible; RedditMediaBot/1.0)',
+  },
+  timeout: 15000,
+};
+
+// Ensure temp directory exists
+if (!fs.existsSync(TEMP_DIR)) {
+  fs.mkdirSync(TEMP_DIR, { recursive: true });
+}
+
+// Simple compression lock — only one compression at a time
+let isCompressing = false;
+
+// ─── Discord Client ──────────────────────────────────────────────────────────
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+  ],
+});
+
+// ─── Utility Functions ───────────────────────────────────────────────────────
+
+/**
+ * Get file size in MB from a local file path.
+ */
+function getLocalFileSize(filePath) {
+  return fs.statSync(filePath).size / (1024 * 1024);
+}
+
+/**
+ * Get file size in MB via HEAD request. Returns null if unavailable.
+ */
+async function getRemoteFileSize(url) {
+  try {
+    const res = await axios.head(url, AXIOS_CONFIG);
+    const contentLength = res.headers['content-length'];
+    if (!contentLength) return null;
+    return parseInt(contentLength, 10) / (1024 * 1024);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Download a file to a local temp path.
+ */
+async function downloadFile(url, filePath) {
+  const res = await axios.get(url, {
+    ...AXIOS_CONFIG,
+    responseType: 'arraybuffer',
+    timeout: 60000,
+  });
+  fs.writeFileSync(filePath, Buffer.from(res.data));
+  return filePath;
+}
+
+/**
+ * Safely delete a temp file.
+ */
+function cleanupFile(filePath) {
+  try {
+    if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
+  } catch {
+    // silent cleanup
+  }
+}
+
+/**
+ * Generate a unique temp file path.
+ */
+function tempPath(ext) {
+  return path.join(TEMP_DIR, `temp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}${ext}`);
+}
+
+// ─── FFmpeg Compression ──────────────────────────────────────────────────────
+
+let FFMPEG_PATH = null;
+
+// Try 1: ffmpeg-static npm package (bundled binary, no system install needed)
+try {
+  const { createRequire } = await import('module');
+  const require = createRequire(import.meta.url);
+  const staticPath = require('ffmpeg-static');
+  if (staticPath && fs.existsSync(staticPath)) {
+    FFMPEG_PATH = staticPath;
+  }
+} catch {
+  // not installed
+}
+
+// Try 2: system-installed ffmpeg
+if (!FFMPEG_PATH) {
+  for (const cmd of ['ffmpeg', '/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg', '/usr/bin/ffmpeg']) {
+    try {
+      execSync(`"${cmd}" -version`, { stdio: 'ignore' });
+      FFMPEG_PATH = cmd;
+      break;
+    } catch {
+      // try next
+    }
+  }
+}
+
+if (FFMPEG_PATH) {
+  console.log(`🎥 FFmpeg found: ${FFMPEG_PATH}`);
+} else {
+  console.warn('⚠️  FFmpeg not found — video compression disabled.');
+  console.warn('   Install via: npm install ffmpeg-static');
+  console.warn('   Or system:   brew install ffmpeg');
+}
+
+/**
+ * Compress a video using FFmpeg. Returns a Promise.
+ * Kills the process if it exceeds the timeout.
+ */
+function compressVideo(inputPath, outputPath) {
+  if (!FFMPEG_PATH) {
+    return Promise.reject(new Error('FFmpeg not installed'));
+  }
+
+  return new Promise((resolve, reject) => {
+    const cmd = `"${FFMPEG_PATH}" -y -i "${inputPath}" -vcodec libx264 -crf 28 -preset veryfast -an "${outputPath}"`;
+
+    const proc = exec(cmd, (error) => {
+      clearTimeout(timer);
+      if (error) {
+        reject(new Error(`FFmpeg failed: ${error.message}`));
+      } else {
+        resolve(outputPath);
+      }
+    });
+
+    // Timeout protection
+    const timer = setTimeout(() => {
+      proc.kill('SIGKILL');
+      reject(new Error(`FFmpeg timed out after ${COMPRESS_TIMEOUT_MS / 1000}s`));
+    }, COMPRESS_TIMEOUT_MS);
+  });
+
+}
+
+// ─── Media Sending ───────────────────────────────────────────────────────────
+
+/**
+ * Send an image or non-video file to Discord.
+ * Downloads, checks size, uploads or sends link.
+ */
+async function sendMedia(message, url, ext) {
+  const sizeMB = await getRemoteFileSize(url);
+  const sizeStr = sizeMB !== null ? `${sizeMB.toFixed(2)} MB` : 'unknown';
+
+  if (sizeMB !== null && sizeMB > MAX_UPLOAD_MB) {
+    console.log(`   📏 ${sizeStr} → sending link (too large)`);
+    await message.reply(`📎 File too large (${sizeStr}), here's the link:\n${url}`);
+    return;
+  }
+
+  console.log(`   📏 ${sizeStr} → uploading to Discord`);
+  const filePath = tempPath(ext);
+  try {
+    await downloadFile(url, filePath);
+
+    const actualSize = getLocalFileSize(filePath);
+    if (actualSize > MAX_UPLOAD_MB) {
+      console.log(`   📏 actual ${actualSize.toFixed(2)} MB → sending link instead`);
+      await message.reply(`📎 File too large (${actualSize.toFixed(2)} MB), here's the link:\n${url}`);
+      return;
+    }
+
+    await message.reply({ files: [filePath] });
+    console.log(`   ✅ Uploaded (${actualSize.toFixed(2)} MB)`);
+  } catch (error) {
+    console.error(`   ❌ Upload failed → sending link: ${error.message}`);
+    await message.reply(`⚠️ Couldn't upload, here's the link:\n${url}`);
+  } finally {
+    cleanupFile(filePath);
+  }
+}
+
+/**
+ * Send a video to Discord with compression support.
+ *   ≤ 8MB  → upload directly
+ *   ≤ 25MB → compress, then try upload
+ *   > 25MB → send link only
+ */
+async function sendVideo(message, url) {
+  const inputPath = tempPath('.mp4');
+  const compressedPath = tempPath('-compressed.mp4');
+
+  try {
+    // Download
+    console.log(`   ⬇️  Downloading video...`);
+    await downloadFile(url, inputPath);
+
+    const originalSize = getLocalFileSize(inputPath);
+    console.log(`   📏 Original: ${originalSize.toFixed(2)} MB`);
+
+    // Case 1: Small enough to upload directly
+    if (originalSize <= MAX_UPLOAD_MB) {
+      console.log(`   ⬆️  Uploading directly`);
+      await message.reply({ files: [inputPath] });
+      console.log(`   ✅ Uploaded (${originalSize.toFixed(2)} MB)`);
+      return;
+    }
+
+    // Case 2: Worth compressing
+    if (originalSize <= MAX_COMPRESS_MB) {
+      // Wait for compression lock
+      if (isCompressing) {
+        console.log(`   ⏳ Compression queue — sending link instead`);
+        await message.reply(`📎 Server busy compressing another video, here's the link:\n${url}`);
+        return;
+      }
+
+      isCompressing = true;
+      try {
+        console.log(`   🗜️  Compressing (${originalSize.toFixed(2)} MB)...`);
+        await compressVideo(inputPath, compressedPath);
+
+        const compressedSize = getLocalFileSize(compressedPath);
+        console.log(`   📏 Compressed: ${compressedSize.toFixed(2)} MB`);
+
+        if (compressedSize <= MAX_UPLOAD_MB) {
+          await message.reply({ files: [compressedPath] });
+          console.log(`   ✅ Uploaded compressed (${compressedSize.toFixed(2)} MB)`);
+          return;
+        } else {
+          console.log(`   📏 Still too large after compression → sending link`);
+        }
+      } catch (err) {
+        console.error(`   ❌ Compression failed: ${err.message}`);
+      } finally {
+        isCompressing = false;
+      }
+    } else {
+      console.log(`   📏 ${originalSize.toFixed(2)} MB > ${MAX_COMPRESS_MB} MB → skipping compression`);
+    }
+
+    // Fallback: send link
+    await message.reply(`📎 Video too large (${originalSize.toFixed(2)} MB), here's the link:\n${url}`);
+  } catch (error) {
+    console.error(`   ❌ Video processing failed: ${error.message}`);
+    await message.reply(`⚠️ Couldn't process video, here's the link:\n${url}`);
+  } finally {
+    cleanupFile(inputPath);
+    cleanupFile(compressedPath);
+  }
+}
+
+// ─── Reddit Helpers ──────────────────────────────────────────────────────────
+
+/**
+ * Resolve Reddit /s/ share links to actual post URLs.
+ */
+async function resolveShareLink(url) {
+  if (!url.includes('/s/')) return url;
+  try {
+    const res = await axios.get(url, { ...AXIOS_CONFIG, maxRedirects: 5 });
+    const resolved = res.request?.res?.responseUrl || res.request?._redirectable?._currentUrl || url;
+    console.log(`   ↪ Resolved share link → ${resolved}`);
+    return resolved;
+  } catch (err) {
+    if (err.response?.headers?.location) return err.response.headers.location;
+    return url;
+  }
+}
+
+/**
+ * Fetch Reddit JSON with configurable cookie and old.reddit support.
+ */
+async function fetchRedditJSON(url, { useCookie = false, useOldReddit = false } = {}) {
+  const cleanUrl = url.split('?')[0].replace(/\/+$/, '');
+  const base = useOldReddit
+    ? cleanUrl.replace('www.reddit.com', 'old.reddit.com')
+    : cleanUrl;
+  const jsonUrl = `${base}.json`;
+
+  const headers = { 'User-Agent': 'Mozilla/5.0 (compatible; RedditMediaBot/1.0)' };
+  if (useCookie && REDDIT_COOKIE) {
+    headers['Cookie'] = REDDIT_COOKIE;
+  }
+
+  const res = await axios.get(jsonUrl, { headers, timeout: 15000 });
+  const post = res.data?.[0]?.data?.children?.[0]?.data;
+  if (!post) throw new Error('No post data in response');
+  return post;
+}
+
+/**
+ * Fetch Reddit post data with multi-attempt fallback.
+ */
+async function getRedditData(url) {
+  const resolvedUrl = await resolveShareLink(url);
+
+  const attempts = [
+    { label: 'normal',              opts: {} },
+    { label: 'cookie',              opts: { useCookie: true } },
+    { label: 'cookie + old.reddit', opts: { useCookie: true, useOldReddit: true } },
+  ];
+
+  for (const { label, opts } of attempts) {
+    try {
+      console.log(`   🔄 Attempt: ${label}`);
+      const post = await fetchRedditJSON(resolvedUrl, opts);
+      if (post.over_18) console.log(`   🔞 NSFW content detected`);
+      console.log(`   ✅ Fetched via ${label}`);
+      return post;
+    } catch (err) {
+      console.log(`   ⚠️  ${label} failed: ${err.message}`);
+    }
+  }
+
+  throw new Error('All fetch attempts failed');
+}
+
+// ─── Redgifs Helpers ─────────────────────────────────────────────────────────
+
+/**
+ * Get a temporary Redgifs API auth token.
+ */
+async function getRedgifsToken() {
+  const res = await axios.get('https://api.redgifs.com/v2/auth/temporary', {
+    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; RedditMediaBot/1.0)' },
+    timeout: 10000,
+  });
+  return res.data.token;
+}
+
+/**
+ * Extract video URL from a Redgifs link.
+ */
+async function getRedgifsVideo(url) {
+  const id = url.split('?')[0].split('/').pop().toLowerCase();
+  if (!id) throw new Error('Could not extract Redgifs ID');
+
+  console.log(`   🎬 Fetching Redgifs ID: ${id}`);
+
+  const token = await getRedgifsToken();
+
+  const res = await axios.get(`https://api.redgifs.com/v2/gifs/${id}`, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (compatible; RedditMediaBot/1.0)',
+      'Authorization': `Bearer ${token}`,
+    },
+    timeout: 10000,
+  });
+
+  const urls = res.data?.gif?.urls;
+  if (!urls) throw new Error('No video URLs in Redgifs response');
+
+  const videoUrl = urls.hd || urls.sd;
+  if (!videoUrl) throw new Error('No HD/SD URL available');
+
+  console.log(`   ✅ Redgifs video: ${videoUrl}`);
+  return videoUrl;
+}
+
+// ─── Post Processing ─────────────────────────────────────────────────────────
+
+/**
+ * Processes a Reddit post: detects type, downloads/uploads or sends links.
+ */
+async function processPost(message, post) {
+  // ── Image ──
+  if (post.post_hint === 'image') {
+    console.log(`🖼️  Type: image`);
+    const ext = post.url.match(/\.(jpg|jpeg|png|gif|webp)/i)?.[0] || '.jpg';
+    await sendMedia(message, post.url, ext);
+    return;
+  }
+
+  // ── Reddit-hosted video ──
+  if (post.is_video) {
+    console.log(`🎬 Type: video`);
+    const fallbackUrl = post.media?.reddit_video?.fallback_url;
+    if (!fallbackUrl) {
+      await message.reply('ℹ️ Video detected but no fallback URL found.');
+      return;
+    }
+    await sendVideo(message, fallbackUrl);
+    return;
+  }
+
+  // ── Gallery ──
+  if (post.is_gallery) {
+    const items = post.gallery_data?.items ?? [];
+    const metadata = post.media_metadata ?? {};
+    const urls = items
+      .map((item) => {
+        const media = metadata[item.media_id];
+        return media?.s?.u ? media.s.u.replace(/&amp;/g, '&') : null;
+      })
+      .filter(Boolean);
+
+    console.log(`🖼️  Type: gallery | ${urls.length} image(s)`);
+
+    if (urls.length === 0) {
+      await message.reply('ℹ️ Gallery detected but no images found.');
+      return;
+    }
+
+    for (const url of urls) {
+      const ext = url.match(/\.(jpg|jpeg|png|gif|webp)/i)?.[0] || '.jpg';
+      await sendMedia(message, url, ext);
+    }
+    return;
+  }
+
+  // ── Redgifs ──
+  if (post.url?.includes('redgifs.com')) {
+    console.log(`🎬 Type: redgifs`);
+    try {
+      const videoUrl = await getRedgifsVideo(post.url);
+      await sendVideo(message, videoUrl);
+    } catch (err) {
+      console.error(`   ❌ Redgifs failed: ${err.message}`);
+      await message.reply(`⚠️ Couldn't fetch Redgifs video, here's the link:\n${post.url}`);
+    }
+    return;
+  }
+
+  // ── Embedded video (external players, preview videos) ──
+  const previewVideo = post.preview?.reddit_video_preview?.fallback_url;
+  const secureEmbed = post.secure_media_embed?.media_domain_url;
+  if (previewVideo) {
+    console.log(`🎬 Type: embedded video (preview)`);
+    await sendVideo(message, previewVideo);
+    return;
+  }
+  if (secureEmbed) {
+    console.log(`🎬 Type: embedded video (secure_media)`);
+    await message.reply(`📎 Embedded media:\n${secureEmbed}`);
+    return;
+  }
+
+  // ── External link with video hint ──
+  if (post.post_hint === 'rich:video' || post.post_hint === 'hosted:video') {
+    console.log(`🎬 Type: ${post.post_hint}`);
+    await message.reply(`📎 External video:\n${post.url}`);
+    return;
+  }
+
+  // ── Unsupported ──
+  console.log(`⚠️  Type: unsupported (hint: ${post.post_hint || 'none'}, domain: ${post.domain || 'unknown'})`);
+  await message.reply('ℹ️ No extractable media found in this post.');
+}
+
+// ─── Events ──────────────────────────────────────────────────────────────────
+
+client.on('error', (err) => console.error('❌ Client error:', err.message));
+
+client.once('ready', () => {
+  console.log(`✅ Bot online as ${client.user.tag} | ${client.guilds.cache.size} server(s)`);
+});
+
+client.on('messageCreate', async (message) => {
+  if (message.author.bot) return;
+
+  const matches = message.content.match(REDDIT_URL_REGEX);
+  if (!matches) return;
+
+  console.log(`📩 ${message.author.tag}: ${message.content}`);
+
+  for (const redditUrl of matches) {
+    console.log(`🔗 Reddit link: ${redditUrl}`);
+
+    try {
+      const post = await getRedditData(redditUrl);
+      await processPost(message, post);
+    } catch (error) {
+      console.error(`❌ Error: ${error.message}`);
+      await message.reply('⚠️ Failed to process Reddit link.');
+    }
+  }
+});
+
+// ─── Login ───────────────────────────────────────────────────────────────────
+
+client.login(BOT_TOKEN);
